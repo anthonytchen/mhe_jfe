@@ -21,7 +21,7 @@ y0 = fedBio_mea(x0);
 t_sample = 2; % sampling interval, hours
 t_simu = 40; % simulation time, hours
 n_sample = t_simu / t_sample;
-n_mhe = 1; % time horizon for moving horizon estimation
+n_mhe = 10; % time horizon for moving horizon estimation
 
 std_x = [0.001 0.001 0.001]; % [Cs Cx V], standard deviation for state noise
 std_y = [0.1 0.05]; % [Cs V], standard deviation for measurement noise
@@ -48,10 +48,10 @@ x_mhe_s = zeros(n_sample+1, nx);
 x_mhe_s(1,:) = x0;
 x_mhe_s_smooth = x_mhe_s; % smoothed version of states in the past
 
-% MHE for state & parameter estimation, but with different time horizon size
-x_mhe_sp2 = zeros(n_sample+1, nx);
-x_mhe_sp2(1,:) = x0;
-x_mhe_sp2_smooth = x_mhe_sp2; % smoothed version of states in the past
+% MHE for state & parameter estimation, but with different window size
+x_mhe_s = zeros(n_sample+1, nx);
+x_mhe_s(1,:) = x0;
+x_mhe_s_smooth = x_mhe_s; % smoothed version of states in the past
 
 Cov_x = std_x.^2;
 Cov_y = std_y.^2;
@@ -59,7 +59,6 @@ Cov_p = ones(size(p)) * 1e10; % a very large covariance for parameter, meaning n
 
 paras_mhe = zeros(n_sample+1, np); 
 paras_mhe(1,:) = [log(2) log(2)] + p; % Initial guess of the parameters are twice of the true values
-paras_mhe2 = paras_mhe; % MHE for state & parameter estimation, but with different time horizone size
 
 
 %% simulation, and MHE state/parameter estimation
@@ -149,50 +148,53 @@ for i = 1 : n_sample
     %% 4. MHE for state and parameter estimation, using the entire data up to this point for parameter estimation, then
     %   a small time horizon for state estimation
     
-    % preparing data for MHE -- first step for parameter estimation
-    xt = x_mhe_sp2(i,:); % MHE estimate of the current states
-    pt = paras_mhe2(i,:); % MHE estimate of the parameters
-    x = fedBio_state(xt, pt, u, t_sample);
-    
-    xseq = [x_mhe_sp2_smooth(1:i,:); x];
-    yseq = [y0; simu.z(1:i,:)]; % use all measurement up to now for parameter estimation
-    useq = u_nom(1:i,:);
-    
-    % call MHE function, '-1' for the last argument means parameter estimation only
-    [x, pa, f_obj] = mhe_w(xseq, useq, yseq, pt, 'fedBio_state', 'fedBio_mea', Cov_x, Cov_y, Cov_p, t_sample, -1);
-    paras_mhe2(i+1,:) = pa';
-    
-    % preparing data for MHE -- second step for state estimation    
-    pt = paras_mhe2(i+1,:); % taking the updated parameters
+    % preparing data for MHE
+    xt = x_mhe_sp(i,:); % MHE estimate of the current states
+    pt = paras_mhe(i,:); % MHE estimate of the parameters
     x = fedBio_state(xt, pt, u, t_sample);
     if i < n_mhe+0.5 % m_mhe is the window size of the moving horizon
-        xseq = [x_mhe_sp2_smooth(1:i,:); x]; % this is the initial value to be optimised by MHE
+        xseq = [x_mhe_sp_smooth(1:i,:); x]; % this is the initial value to be optimised by MHE
         yseq = [y0; simu.z(1:i,:)];
         useq = u_nom(1:i,:);
     else
-        xseq = [x_mhe_sp2_smooth(i-n_mhe+1:i,:); x]; % this is the initial value to be optimised by MHE
+        xseq = [x_mhe_sp_smooth(i-n_mhe+1:i,:); x]; % this is the initial value to be optimised by MHE
         yseq = simu.z(i-n_mhe:i,:);
         useq = u_nom( i-n_mhe+1:i, : );
     end           
     
     % call MHE function
-    [x, pa, f_obj] = mhe_w(xseq, useq, yseq, pt, 'fedBio_state', 'fedBio_mea', Cov_x, Cov_y, Cov_p, t_sample, 0);    
+    
+    paras_only = 1; 
+    % If paras_only == 1, the optimisation algorithm only updates parameters, 
+    %   after which the states are re-calculated using the estimated parameters
+    % If paras_only == 0, then both states and parameters are updated by using optimisation
+    
+    % So there is a mixed strategy to avoid the need to optimise a very long state sequence.
+    %   That is, first update parameters by using all measurements up to the current time.
+    %   Then use a short moving horizon (e.g. two time steps) in MHE to update the states only
+    if paras_only
+        [x, pa, f_obj] = mhe_w(xseq, useq, yseq, pt, 'fedBio_state', 'fedBio_mea', Cov_x, Cov_y, Cov_p, t_sample, -1);
+    else
+        [x, pa, f_obj] = mhe_w(xseq, useq, yseq, pt, 'fedBio_state', 'fedBio_mea', Cov_x, Cov_y, Cov_p, t_sample, 1);    
+    end
+    
+    paras_mhe(i+1,:) = pa';
     
     if i < n_mhe
-        x_mhe_sp2_smooth(1:i+1,:) = x;
-        x_mhe_sp2(i+1,:) = x(i+1,:);
+        x_mhe_sp_smooth(1:i+1,:) = x;
+        x_mhe_sp(i+1,:) = x(i+1,:);
     else
-        x_mhe_sp2_smooth(i-n_mhe+1:i+1,:) = x;
-        x_mhe_sp2(i+1,:) = x(size(x,1),:);
-    end   
+        x_mhe_sp_smooth(i-n_mhe+1:i+1,:) = x;
+        x_mhe_sp(i+1,:) = x(size(x,1),:);
+    end
     
 end
 
 %% Plot the results
 
 t_seq = 0:t_sample:t_simu;
-plot(t_seq, [x0(2); simu.xtrue(:,2)], 'r-', t_seq, x_mhe_s(:,2), 'k-o', t_seq, x_mhe_sp(:,2), 'b-x', t_seq, x_mhe_sp2(:,2), 'm-^');
-legend('Simu', 'State Est.', 'State & Para. Est. Comb.', 'State & Para. Est. 2-Step');
+plot(t_seq, [x0(2); simu.xtrue(:,2)], 'r-', t_seq, x_mhe_s(:,2), 'k-o', t_seq, x_mhe_sp(:,2), 'b-x');
+legend('Simu', 'State Est.', 'State & Para. Est.');
 xlabel('Time (hr)');
 ylabel('X [g/L]');
 
